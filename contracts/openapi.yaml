@@ -1,0 +1,1030 @@
+openapi: 3.1.0
+
+info:
+  title: Hookary API
+  version: 0.1.0
+  description: |
+    The single contract between Flutter and the Go API.
+
+    Two rules shape this document:
+
+    - **Media bytes never cross this API.** Uploads and downloads go straight to
+      R2 through presigned URLs minted here. No endpoint accepts or returns a
+      video body.
+    - **Ids are ULIDs**, rendered as 26-character Crockford base32 strings.
+
+    Dart models are hand-written against this file. It is the source of truth,
+    not generated output.
+
+servers:
+  - url: http://localhost:8000
+    description: Local compose stack
+  - url: https://api.hookary.com
+    description: Production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+    description: Google Sign-In and Hookary's own session tokens.
+  - name: projects
+    description: A project owns the source video and the clips cut from it.
+  - name: uploads
+    description: Presigned direct-to-R2 uploads. No bytes pass through the API.
+  - name: imports
+    description: Pulling a source video from a public URL.
+  - name: jobs
+    description: Background pipeline state, and the progress stream.
+  - name: clips
+    description: Suggested moments, their edits, and their rendered output.
+  - name: publishing
+    description: Platform connections and uploads to YouTube.
+
+paths:
+  /health/live:
+    get:
+      tags: [jobs]
+      summary: Liveness — ignores dependencies
+      security: []
+      responses:
+        "200": { description: Process is up }
+
+  /health/ready:
+    get:
+      tags: [jobs]
+      summary: Readiness — reports dependencies
+      security: []
+      responses:
+        "200": { description: Ready to serve }
+        "503": { description: A dependency is unavailable }
+
+  # ---------------------------------------------------------------- auth
+  /v1/auth/google:
+    post:
+      tags: [auth]
+      summary: Exchange a Google ID token for a Hookary session
+      description: |
+        Verifies signature, issuer, audience, and expiry, then creates or
+        updates the local user. Login requests `openid`, `email`, `profile` and
+        nothing more — YouTube upload is a separate grant.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token, client_kind]
+              properties:
+                id_token: { type: string }
+                client_kind: { $ref: "#/components/schemas/ClientKind" }
+      responses:
+        "200":
+          description: Session created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503":
+          description: Google Sign-In is not configured on this server
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate the refresh token
+      description: |
+        On web the refresh token comes from an HttpOnly cookie and the body is
+        empty. On mobile it is sent in the body from secure storage. The old
+        token is invalidated on every call — reuse of a rotated token
+        invalidates the whole session.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client_kind: { $ref: "#/components/schemas/ClientKind" }
+                refresh_token:
+                  type: string
+                  description: Mobile only. On web the cookie carries it.
+      responses:
+        "200":
+          description: Rotated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401":
+          description: |
+            No session, or a token that had already been rotated away. The
+            latter can only be a leak or a replay, so the whole session chain is
+            revoked — the client must sign in again, not retry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the current session
+      description: |
+        Web identifies the session with the HttpOnly refresh cookie. Mobile
+        sends its refresh token from secure storage. The access token is also
+        accepted, but may already be expired when the user signs out.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client_kind: { $ref: "#/components/schemas/ClientKind" }
+                refresh_token:
+                  type: string
+                  description: Mobile only. On web the cookie carries it.
+      responses:
+        "204": { description: Logged out }
+
+  /v1/me:
+    get:
+      tags: [auth]
+      summary: The signed-in user
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ------------------------------------------------------------ projects
+  /v1/projects:
+    get:
+      tags: [projects]
+      summary: List the caller's projects
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items: { $ref: "#/components/schemas/Project" }
+                  next_cursor: { type: [string, "null"] }
+    post:
+      tags: [projects]
+      summary: Create a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Project" }
+
+  /v1/projects/{project_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [projects]
+      summary: Get a project
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Project" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [projects]
+      summary: Delete a project and its media
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{project_id}/assets:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [projects]
+      summary: List a project's source videos
+      description: |
+        Returns persistent source metadata for both direct uploads and public
+        URL imports. Presigned URLs are deliberately omitted; request one only
+        when the user opens a preview.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assets]
+                properties:
+                  assets:
+                    type: array
+                    items: { $ref: "#/components/schemas/SourceAsset" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ------------------------------------------------------------- uploads
+  /v1/uploads:
+    post:
+      tags: [uploads]
+      summary: Start an upload
+      description: |
+        Creates the asset row and picks the object key — the client never
+        chooses it. Small files get a single presigned PUT; video gets an S3
+        multipart session.
+
+        Content-Type is part of the signature, so the value sent here must match
+        the header used on the PUT or the upload is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project_id, filename, content_type, size_bytes]
+              properties:
+                project_id: { $ref: "#/components/schemas/Ulid" }
+                filename: { type: string }
+                content_type: { type: string, examples: ["video/mp4"] }
+                size_bytes: { type: integer, format: int64 }
+      responses:
+        "201":
+          description: Upload session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Upload" }
+
+  /v1/uploads/{upload_id}/parts:
+    parameters:
+      - $ref: "#/components/parameters/UploadId"
+    post:
+      tags: [uploads]
+      summary: Get presigned URLs for a batch of multipart parts
+      description: |
+        Requested in batches so a paused upload can resume without re-signing
+        every part. URLs are short-lived; a resumed upload asks again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [part_numbers]
+              properties:
+                part_numbers:
+                  type: array
+                  items: { type: integer, minimum: 1, maximum: 10000 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  parts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        part_number: { type: integer }
+                        url: { type: string, format: uri }
+                        expires_at: { type: string, format: date-time }
+
+  /v1/uploads/{upload_id}/complete:
+    parameters:
+      - $ref: "#/components/parameters/UploadId"
+    post:
+      tags: [uploads]
+      summary: Finalize the upload and queue ingest
+      description: |
+        Completes the multipart upload, HEADs the object to confirm it is really
+        there and the size matches, then enqueues an ingest job. Trusting the
+        client's word here would let a failed upload enter the pipeline.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parts:
+                  type: array
+                  description: Required for multipart uploads; omitted for a single PUT.
+                  items:
+                    type: object
+                    required: [part_number, etag]
+                    properties:
+                      part_number: { type: integer }
+                      etag: { type: string }
+      responses:
+        "202":
+          description: Ingest queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "409":
+          description: Object missing or size mismatch
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/uploads/{upload_id}:
+    parameters:
+      - $ref: "#/components/parameters/UploadId"
+    get:
+      tags: [uploads]
+      summary: Resume an upload
+      description: |
+        Returns the server-owned session metadata and the parts already present
+        in R2. Presigned URLs are deliberately not persisted; the client asks
+        `/parts` for fresh URLs for whatever remains.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Upload" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [uploads]
+      summary: Abort the upload
+      description: Aborts the multipart session so orphaned parts stop being billed.
+      responses:
+        "204": { description: Aborted }
+
+  /v1/assets/{asset_id}/preview-url:
+    parameters:
+      - $ref: "#/components/parameters/AssetId"
+    post:
+      tags: [uploads]
+      summary: Mint a source-video preview URL
+      description: |
+        Returns a short-lived presigned GET for either a verified direct upload
+        or a completed public URL import. The URL supports HTTP Range and is a
+        bearer token, so neither the API nor the client logs it. When analysis
+        has completed, `subtitles_url` points directly to the gzipped transcript
+        JSON in private object storage.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PresignedUrl" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The source is not ready or is missing from storage
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/assets/{asset_id}/analyze:
+    parameters:
+      - $ref: "#/components/parameters/AssetId"
+    post:
+      tags: [jobs]
+      summary: Prepare an existing source for transcript analysis
+      description: |
+        Idempotently reruns ingest v2 and then the real analyze pipeline for a
+        ready source that has no transcript. This upgrades sources processed by
+        the earlier demo worker without forcing the user to upload them again.
+      responses:
+        "202":
+          description: Analysis queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Source is not ready or already has a transcript
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ------------------------------------------------------------- imports
+  /v1/imports:
+    post:
+      tags: [imports]
+      summary: Import from a public URL
+      description: |
+        Only public URLs. Private, DRM, and paywalled sources are rejected, as
+        are localhost, private ranges, and cloud metadata endpoints.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project_id, url]
+              properties:
+                project_id: { $ref: "#/components/schemas/Ulid" }
+                url: { type: string, format: uri }
+      responses:
+        "202":
+          description: Ingest queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "422":
+          description: URL rejected
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------- jobs
+  /v1/jobs/{job_id}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [jobs]
+      summary: Get job state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{project_id}/jobs:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [jobs]
+      summary: List the project's pipeline jobs
+      description: Returns the durable Postgres snapshot used before subscribing to live updates.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/jobs/{job_id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    post:
+      tags: [jobs]
+      summary: Retry a failed job
+      responses:
+        "202":
+          description: Requeued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "409":
+          description: Job is not in a retryable state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/ws:
+    get:
+      tags: [jobs]
+      summary: Job progress stream (WebSocket)
+      security: []
+      description: |
+        Browser WebSockets cannot attach a bearer header. The first client
+        frame must therefore be
+        `{"type":"authenticate","access_token":"...","project_id":"01..."}`.
+        The server authorizes that project, sends a `snapshot` envelope, then
+        streams `job_updated` envelopes. The token never appears in the URL.
+
+        State changes only — never payloads. Clients must treat this stream as
+        an optimization and poll `/v1/projects/{project_id}/jobs` as a fallback.
+      responses:
+        "101": { description: Switching protocols }
+
+  # --------------------------------------------------------------- clips
+  /v1/projects/{project_id}/clips:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [clips]
+      summary: List clips, best first
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  clips:
+                    type: array
+                    items: { $ref: "#/components/schemas/Clip" }
+
+  /v1/projects/{project_id}/clips/render:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      tags: [clips]
+      summary: Render selected suggestions as full-frame vertical MP4 files
+      description: |
+        The output is a 1080x1920 Shorts canvas with the source fitted inside a
+        full-width horizontal 16:9 frame. A dark, blurred copy of the current frame
+        fills the space above and below, and subtitles use the lower safe zone.
+        Clips made with an older render revision may be selected once more.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [clip_ids]
+              properties:
+                clip_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 5
+                  uniqueItems: true
+                  items: { $ref: "#/components/schemas/Ulid" }
+      responses:
+        "202":
+          description: Render jobs queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/clips/{clip_id}:
+    parameters:
+      - $ref: "#/components/parameters/ClipId"
+    get:
+      tags: [clips]
+      summary: Get a clip
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Clip" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [clips]
+      summary: Adjust a clip before rendering
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                start_ms: { type: integer, format: int64 }
+                end_ms: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Clip" }
+
+  /v1/clips/{clip_id}/download-url:
+    parameters:
+      - $ref: "#/components/parameters/ClipId"
+    post:
+      tags: [clips]
+      summary: Mint a short-lived download URL
+      description: |
+        Returns a presigned GET. Treat it as a bearer token: it is short-lived,
+        and it must not be logged or shared.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+                  filename: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "409":
+          description: Clip has not been rendered yet
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/clips/{clip_id}/preview-url:
+    parameters:
+      - $ref: "#/components/parameters/ClipId"
+    post:
+      tags: [clips]
+      summary: Mint a short-lived inline preview URL for a rendered clip
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expires_at]
+                properties:
+                  url: { type: string, format: uri }
+                  expires_at: { type: string, format: date-time }
+        "409":
+          description: Clip has not been rendered yet
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------- publishing
+  /v1/platforms:
+    get:
+      tags: [publishing]
+      summary: List connected platforms
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  platforms:
+                    type: array
+                    items: { $ref: "#/components/schemas/PlatformConnection" }
+
+  /v1/platforms/youtube/connect:
+    post:
+      tags: [publishing]
+      summary: Begin the YouTube upload grant
+      description: |
+        A separate OAuth grant from Sign-In, requested only when the user first
+        publishes. The refresh token is stored encrypted and never leaves the
+        backend.
+      responses:
+        "200":
+          description: Consent URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authorization_url: { type: string, format: uri }
+                  state: { type: string }
+
+  /v1/clips/{clip_id}/publish:
+    parameters:
+      - $ref: "#/components/parameters/ClipId"
+    post:
+      tags: [publishing]
+      summary: Publish a rendered clip
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+          description: |
+            Required. Retrying a publish without one risks a duplicate upload,
+            which cannot be undone from the user's side.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform]
+              properties:
+                platform: { type: string, enum: [youtube] }
+                title: { type: string }
+                description: { type: string }
+                visibility: { type: string, enum: [public, unlisted, private], default: private }
+      responses:
+        "202":
+          description: Publish queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Publication" }
+
+  /v1/publications/{publication_id}:
+    parameters:
+      - name: publication_id
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/Ulid" }
+    get:
+      tags: [publishing]
+      summary: Get a publication
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Publication" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The short-lived access token. Kept in memory only, never persisted.
+
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Ulid" }
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Ulid" }
+    AssetId:
+      name: asset_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Ulid" }
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Ulid" }
+    ClipId:
+      name: clip_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Ulid" }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found, or not the caller's
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Ulid:
+      type: string
+      pattern: "^[0-9A-HJKMNP-TV-Z]{26}$"
+      examples: ["01JZ8XKQ4T6N9R2VBC3D5EFGHJ"]
+
+    ClientKind:
+      type: string
+      enum: [web, mobile]
+      description: |
+        How this client can hold a refresh token, which decides how the server
+        delivers it.
+
+        `web` gets an HttpOnly cookie and a null `refresh_token` in the body —
+        JavaScript must never be able to read it. `mobile` gets the token in the
+        body and puts it in the platform keystore.
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable machine-readable code. `budget_exhausted` means the OpenAI
+            spend limit is reached — the client must stop retrying and say so.
+          examples: ["budget_exhausted", "url_rejected", "not_ready"]
+        message: { type: string }
+        request_id: { type: string }
+
+    User:
+      type: object
+      properties:
+        id: { $ref: "#/components/schemas/Ulid" }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        avatar_url: { type: [string, "null"], format: uri }
+        created_at: { type: string, format: date-time }
+
+    TokenPair:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: Short-lived. Memory only.
+        expires_in: { type: integer, description: Seconds until the access token expires. }
+        refresh_token:
+          type: [string, "null"]
+          description: |
+            Mobile only. On web this is null and the token is set as an HttpOnly,
+            Secure, SameSite cookie instead, so JavaScript cannot read it.
+
+    Project:
+      type: object
+      required: [id, title, status, asset_count, clip_count, created_at, updated_at]
+      properties:
+        id: { $ref: "#/components/schemas/Ulid" }
+        title: { type: string }
+        status: { type: string, enum: [empty, processing, ready, failed] }
+        asset_count: { type: integer }
+        clip_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    SourceAsset:
+      type: object
+      required:
+        - id
+        - project_id
+        - source_kind
+        - title
+        - status
+        - preview_ready
+        - transcript_ready
+        - transcript_status
+        - analysis_status
+        - created_at
+        - updated_at
+      properties:
+        id: { $ref: "#/components/schemas/Ulid" }
+        project_id: { $ref: "#/components/schemas/Ulid" }
+        source_kind: { type: string, enum: [r2_upload, public_url] }
+        title: { type: string }
+        status: { type: string, enum: [pending, ready, failed] }
+        preview_ready:
+          type: boolean
+          description: Whether the client may request a preview URL now.
+        transcript_ready:
+          type: boolean
+          description: Whether readable timed subtitles are available.
+        transcript_status:
+          type: string
+          enum: [pending, queued, running, succeeded, failed]
+        analysis_status:
+          type: string
+          enum: [pending, queued, running, succeeded, failed]
+          description: Full transcription and clip-selection stage status.
+        content_type: { type: [string, "null"] }
+        size_bytes: { type: [integer, "null"], format: int64 }
+        duration_ms: { type: [integer, "null"], format: int64 }
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Upload:
+      type: object
+      required:
+        - upload_id
+        - asset_id
+        - project_id
+        - mode
+        - size_bytes
+        - content_type
+        - status
+        - uploaded_parts
+        - expires_at
+      properties:
+        upload_id: { $ref: "#/components/schemas/Ulid" }
+        asset_id: { $ref: "#/components/schemas/Ulid" }
+        project_id: { $ref: "#/components/schemas/Ulid" }
+        mode:
+          type: string
+          enum: [single_put, multipart]
+        url:
+          type: [string, "null"]
+          format: uri
+          description: Set for single_put only.
+        part_size_bytes:
+          type: [integer, "null"]
+          description: Set for multipart. Starts at 32 MiB.
+        size_bytes: { type: integer, format: int64 }
+        content_type: { type: string }
+        status: { type: string, enum: [pending, completed, aborted] }
+        uploaded_parts:
+          type: array
+          items: { $ref: "#/components/schemas/UploadedPart" }
+        expires_at: { type: string, format: date-time }
+
+    UploadedPart:
+      type: object
+      required: [part_number, etag, size_bytes]
+      properties:
+        part_number: { type: integer, minimum: 1, maximum: 10000 }
+        etag: { type: string }
+        size_bytes: { type: integer, format: int64 }
+
+    PresignedUrl:
+      type: object
+      required: [url, expires_at]
+      properties:
+        url: { type: string, format: uri }
+        subtitles_url:
+          type: string
+          format: uri
+          description: Short-lived direct URL to the timed transcript JSON, when ready.
+        expires_at: { type: string, format: date-time }
+
+    Job:
+      type: object
+      required:
+        - id
+        - project_id
+        - stage
+        - status
+        - progress
+        - attempt
+        - created_at
+        - updated_at
+      properties:
+        id: { $ref: "#/components/schemas/Ulid" }
+        project_id: { $ref: "#/components/schemas/Ulid" }
+        stage: { type: string, enum: [ingest, analyze, render, publish] }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        progress: { type: [number, "null"], minimum: 0, maximum: 1 }
+        attempt: { type: integer }
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/Error"
+            - type: "null"
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Clip:
+      type: object
+      required:
+        - id
+        - project_id
+        - asset_id
+        - title
+        - score
+        - start_ms
+        - end_ms
+        - status
+        - can_render
+      properties:
+        id: { $ref: "#/components/schemas/Ulid" }
+        project_id: { $ref: "#/components/schemas/Ulid" }
+        asset_id: { $ref: "#/components/schemas/Ulid" }
+        title: { type: string }
+        hook: { type: [string, "null"], description: The opening line that earns the watch. }
+        reason: { type: [string, "null"], description: Why the model picked this moment. }
+        score: { type: number, minimum: 0, maximum: 1 }
+        context_risk: { type: [string, "null"], enum: [low, medium, high, null] }
+        start_ms: { type: integer, format: int64 }
+        end_ms: { type: integer, format: int64 }
+        status: { type: string, enum: [candidate, rendering, rendered, failed] }
+        can_render:
+          type: boolean
+          description: Whether this clip can be selected for the current render revision.
+        thumbnail_url: { type: [string, "null"], format: uri }
+        preview_url:
+          type: [string, "null"]
+          format: uri
+          description: Short-lived presigned GET. Supports HTTP Range.
+
+    PlatformConnection:
+      type: object
+      properties:
+        platform: { type: string, enum: [youtube] }
+        connected: { type: boolean }
+        account_name: { type: [string, "null"] }
+        connected_at: { type: [string, "null"], format: date-time }
+
+    Publication:
+      type: object
+      properties:
+        id: { $ref: "#/components/schemas/Ulid" }
+        clip_id: { $ref: "#/components/schemas/Ulid" }
+        platform: { type: string, enum: [youtube] }
+        status: { type: string, enum: [queued, uploading, published, failed] }
+        external_id: { type: [string, "null"] }
+        external_url: { type: [string, "null"], format: uri }
+        created_at: { type: string, format: date-time }

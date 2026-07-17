@@ -1,0 +1,54 @@
+{
+  "project_info": {
+    "project_number": "1092771745376",
+    "project_id": "hookary-9b135",
+    "storage_bucket": "hookary-9b135.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1092771745376:android:b5ba63c368f0ebb359fd05",
+        "android_client_info": {
+          "package_name": "com.hookary.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1092771745376-huec9nv0envmvmhpr9efdg296nshrbk7.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.hookary.app",
+            "certificate_hash": "ea39f70ca8593546229ac8d5292f354d00952089"
+          }
+        },
+        {
+          "client_id": "1092771745376-p533t0lk61tik7ttndt7agtfrl0mktf8.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBv8h02_lht82-I9dKUKolEr7H9-ijjWWU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1092771745376-p533t0lk61tik7ttndt7agtfrl0mktf8.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "1092771745376-ltcfv44i096ek8sh8bk9tdnqmmgf5v0f.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.mshupeikin.hookary"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

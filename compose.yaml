@@ -1,0 +1,288 @@
+# Local Hookary stack: docker compose up -d
+#
+# MinIO stands in for Cloudflare R2. It speaks the same S3 API, so only the
+# S3_* values differ in production — no code path is MinIO-specific.
+
+name: hookary
+
+# Every Go service is built from the same context and needs the same backing
+# services, so the shared parts live here once.
+x-go-build: &go-build
+  context: ./backend
+  dockerfile: ../deploy/docker/Dockerfile.go
+
+x-media-build: &media-build
+  context: ./backend
+  dockerfile: ../deploy/docker/Dockerfile.media
+
+# In-network addresses. These deliberately shadow the host-side values in .env:
+# containers reach each other by service name, not localhost.
+x-backend-env: &backend-env
+  HOOKARY_ENV: ${HOOKARY_ENV:-dev}
+  LOG_LEVEL: ${LOG_LEVEL:-debug}
+  DATABASE_URL: postgres://${POSTGRES_USER:-hookary}:${POSTGRES_PASSWORD:-hookary_local_dev}@postgres:5432/${POSTGRES_DB:-hookary}?sslmode=disable
+  DATABASE_MAX_CONNS: ${DATABASE_MAX_CONNS:-10}
+  NATS_URL: nats://nats:4222
+  S3_ENDPOINT: http://minio:9000
+  # Presigned URLs are opened by the host browser, which cannot resolve the
+  # Compose-only `minio` hostname. Production uses the R2 S3 API endpoint here.
+  S3_PUBLIC_ENDPOINT: http://localhost:${MINIO_API_PORT:-9000}
+  S3_REGION: ${S3_REGION:-auto}
+  S3_BUCKET: ${S3_BUCKET:-hookary-media-dev}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-hookary_minio}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-hookary_minio_local_dev}
+  S3_FORCE_PATH_STYLE: "true"
+  S3_PRESIGN_TTL: ${S3_PRESIGN_TTL:-15m}
+
+x-depends-on-infra: &depends-on-infra
+  postgres:
+    condition: service_healthy
+  nats:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+
+services:
+  frontend:
+    # Flutter is built on the host by `make web-docker`. Keeping only nginx in
+    # Docker avoids downloading a second Flutter SDK and an Android toolchain.
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    ports:
+      - "${HOOKARY_WEB_PORT:-8000}:80"
+    volumes:
+      - ./frontend/build/web:/usr/share/nginx/html:ro
+      - ./deploy/docker/nginx-web.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hookary}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hookary_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-hookary}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Postgres 18+ images keep data in a subdirectory of this path and refuse
+      # to start if the mount is at /var/lib/postgresql/data instead.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # -U/-d matter: bare pg_isready passes while the app database is still
+      # being created, and dependents would start too early.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hookary} -d ${POSTGRES_DB:-hookary}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  nats:
+    image: nats:2-alpine
+    restart: unless-stopped
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITORING_PORT:-8222}:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      # healthz reports JetStream readiness, not just that the port is open.
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-hookary_minio}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-hookary_minio_local_dev}
+      # MinIO has no per-bucket CORS API — it only takes a server-wide origin
+      # list. R2 does do per-bucket rules; those live in deploy/cloudflare/.
+      # This is the one place local storage cannot mirror production exactly.
+      MINIO_API_CORS_ALLOW_ORIGIN: ${CORS_ALLOWED_ORIGINS:-http://localhost:8000}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # Creates the dev bucket and applies the CORS rules that browser uploads need.
+  # Runs to completion and exits; it is not a long-lived service.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_BUCKET: ${S3_BUCKET:-hookary-media-dev}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-hookary_minio}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-hookary_minio_local_dev}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8000}
+    entrypoint: ["/bin/sh", "/init/minio-init.sh"]
+    volumes:
+      - ./deploy/docker/minio-init.sh:/init/minio-init.sh:ro
+
+  api:
+    build:
+      <<: *go-build
+      args:
+        SERVICE: api
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      API_ADDR: ":8080"
+      JWT_SECRET: ${JWT_SECRET:-dev_only_insecure_secret}
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+      REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-720h}
+      GOOGLE_CLIENT_ID_WEB: ${GOOGLE_CLIENT_ID_WEB:-}
+      GOOGLE_CLIENT_ID_IOS: ${GOOGLE_CLIENT_ID_IOS:-}
+      GOOGLE_CLIENT_ID_ANDROID: ${GOOGLE_CLIENT_ID_ANDROID:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8000}
+    ports:
+      - "8080:8080"
+    depends_on: *depends-on-infra
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8080/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  ingest:
+    build:
+      <<: *media-build
+      args:
+        SERVICE: ingest
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      INGEST_HEALTH_ADDR: ":8081"
+      INGEST_WORK_DIR: /work
+      INGEST_MAX_MEDIA_BYTES: ${INGEST_MAX_MEDIA_BYTES:-4294967296}
+      INGEST_MAX_DURATION: ${INGEST_MAX_DURATION:-4h}
+      INGEST_METADATA_TIMEOUT: ${INGEST_METADATA_TIMEOUT:-2m}
+      INGEST_DOWNLOAD_TIMEOUT: ${INGEST_DOWNLOAD_TIMEOUT:-90m}
+      INGEST_PROBE_TIMEOUT: ${INGEST_PROBE_TIMEOUT:-2m}
+      INGEST_NORMALIZE_TIMEOUT: ${INGEST_NORMALIZE_TIMEOUT:-2h}
+      INGEST_AUDIO_TIMEOUT: ${INGEST_AUDIO_TIMEOUT:-2h}
+      INGEST_AUDIO_CHUNK_LENGTH: ${INGEST_AUDIO_CHUNK_LENGTH:-20m}
+    ports:
+      - "8081:8081"
+    depends_on: *depends-on-infra
+    volumes:
+      - ingest-work:/work
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8081/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  analyze:
+    build:
+      <<: *go-build
+      args:
+        SERVICE: analyze
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      ANALYZE_HEALTH_ADDR: ":8082"
+      ANALYZE_WORK_DIR: /tmp
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TRANSCRIBE_MODEL: ${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
+      OPENAI_RANK_MODEL: ${OPENAI_RANK_MODEL:-gpt-5.4-nano-2026-03-17}
+      OPENAI_SELECT_MODEL: ${OPENAI_SELECT_MODEL:-gpt-5.4-mini-2026-03-17}
+      OPENAI_CLIP_PROMPT_VERSION: ${OPENAI_CLIP_PROMPT_VERSION:-clip-selection-v2}
+      OPENAI_BUDGET_LIMIT_USD: ${OPENAI_BUDGET_LIMIT_USD:-45}
+      OPENAI_REQUEST_TIMEOUT: ${OPENAI_REQUEST_TIMEOUT:-10m}
+    ports:
+      - "8082:8082"
+    depends_on: *depends-on-infra
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8082/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  render:
+    build:
+      <<: *media-build
+      args:
+        SERVICE: render
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      RENDER_HEALTH_ADDR: ":8083"
+      RENDER_WORK_DIR: /work
+      RENDER_TIMEOUT: ${RENDER_TIMEOUT:-2h}
+      RENDER_MAX_SOURCE_BYTES: ${RENDER_MAX_SOURCE_BYTES:-4294967296}
+      RENDER_FFMPEG_THREADS: ${RENDER_FFMPEG_THREADS:-2}
+      RENDER_MAX_CONCURRENT: ${RENDER_MAX_CONCURRENT:-1}
+    ports:
+      - "8083:8083"
+    depends_on: *depends-on-infra
+    volumes:
+      - render-work:/work
+    # FFmpeg will saturate every core it is given and starve the rest of the
+    # stack. The worker's own semaphore is sized from this limit.
+    cpus: 2
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8083/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  publish:
+    build:
+      <<: *go-build
+      args:
+        SERVICE: publish
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      PUBLISH_HEALTH_ADDR: ":8084"
+      YOUTUBE_CLIENT_ID: ${YOUTUBE_CLIENT_ID:-}
+      YOUTUBE_CLIENT_SECRET: ${YOUTUBE_CLIENT_SECRET:-}
+      YOUTUBE_REDIRECT_URL: ${YOUTUBE_REDIRECT_URL:-}
+      PLATFORM_TOKEN_ENCRYPTION_KEY: ${PLATFORM_TOKEN_ENCRYPTION_KEY:-}
+    ports:
+      - "8084:8084"
+    depends_on: *depends-on-infra
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8084/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  nats-data:
+  minio-data:
+  ingest-work:
+  render-work:

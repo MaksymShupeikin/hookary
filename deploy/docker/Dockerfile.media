@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1
+#
+# Build context is ./backend. Same recipe as Dockerfile.go, plus the media
+# binaries. ingest and render shell out to these; no other service may, which
+# is why they get a separate image instead of one fat base.
+
+ARG GO_VERSION=1.26
+ARG ALPINE_VERSION=3.22
+
+FROM alpine:${ALPINE_VERSION} AS yt-dlp
+ARG TARGETARCH
+ARG YT_DLP_VERSION=2026.06.09
+RUN apk add --no-cache ca-certificates curl \
+    && case "${TARGETARCH}" in \
+         amd64) artifact=yt-dlp_musllinux; sha256=74b20e9e0d8948cccd81004cb64576293cd41b8f4e7f5b6bdc4a253c3bb9b79a ;; \
+         arm64) artifact=yt-dlp_musllinux_aarch64; sha256=032863bbf7c90c17fd52a8ec2c495b449465ded6b44a06bb28a974a7faf2e875 ;; \
+         *) echo "unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
+       esac \
+    && curl --fail --location --retry 3 \
+         "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${artifact}" \
+         --output /yt-dlp \
+    && echo "${sha256}  /yt-dlp" | sha256sum -c - \
+    && chmod 0755 /yt-dlp
+
+FROM golang:${GO_VERSION}-alpine AS build
+WORKDIR /src
+
+COPY . .
+ARG SERVICE
+RUN test -d "./services/${SERVICE}" || { echo "unknown SERVICE=${SERVICE}"; exit 1; }
+
+# See Dockerfile.go: caches are mounted rather than baked, and there is no
+# `go mod download` step on purpose.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/service "./services/${SERVICE}"
+
+FROM alpine:${ALPINE_VERSION} AS runtime
+
+# The official musl build is pinned and checksum-verified above. Node is the
+# JavaScript runtime used by the bundled yt-dlp-ejs component for full YouTube
+# support; it is enabled explicitly in every yt-dlp invocation.
+RUN apk add --no-cache ca-certificates ffmpeg font-noto nodejs \
+    && adduser -D -u 10001 hookary
+
+# Scratch space for downloads and FFmpeg intermediates. Nothing here outlives a
+# job: the worker deletes its files, and the volume is not shared between jobs.
+RUN mkdir -p /work && chown hookary:hookary /work
+VOLUME ["/work"]
+
+COPY --from=yt-dlp /yt-dlp /usr/local/bin/yt-dlp
+COPY --from=build /out/service /usr/local/bin/service
+USER hookary
+ENTRYPOINT ["/usr/local/bin/service"]

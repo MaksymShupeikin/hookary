@@ -1,0 +1,21 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-work-after-3-days",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "work/" },
+      "Expiration": { "Days": 3 }
+    },
+    {
+      "ID": "expire-source-after-30-days",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "source/" },
+      "Expiration": { "Days": 30 }
+    },
+    {
+      "ID": "abort-incomplete-multipart-after-1-day",
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+# Lint config for openapi.yaml: make contracts-lint
+#
+# Starts from redocly's recommended rules. The rules turned off below are
+# switched off deliberately, each for a stated reason — anything not listed
+# here is expected to pass.
+
+extends:
+  - recommended
+
+rules:
+  # Dart models are hand-written from this file rather than generated, so an
+  # operationId would be an identifier nothing reads.
+  operation-operationId: off
+
+  # Errors are documented on the operations where the client must branch on
+  # them. Requiring a 4xx block on every operation would add noise, not
+  # information.
+  operation-4xx-response: off
+
+  # The localhost server entry is the local compose stack, and is meant to be
+  # there.
+  no-server-example.com: off
+
+  # Private project; there is no license to declare.
+  info-license: off
+
+  # /v1/ws answers 101 Switching Protocols. For a WebSocket upgrade that is the
+  # correct response, and a 2xx would be wrong.
+  operation-2xx-response: off

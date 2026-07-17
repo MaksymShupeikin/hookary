@@ -1,0 +1,9 @@
+# Copy to key.properties and fill in. key.properties is gitignored and must
+# never be committed: it holds the password to the app signing key.
+#
+# storeFile points outside the repo on purpose — a keystore that lives in the
+# working tree eventually gets committed.
+storePassword=<from your password manager>
+keyPassword=<from your password manager>
+keyAlias=hookary-upload
+storeFile=/Users/<you>/.keystores/hookary-upload.jks

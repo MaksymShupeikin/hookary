@@ -1,0 +1,27 @@
+# Secrets. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+
+# Go
+/backend/bin/
+*.test
+
+# Flutter / Dart — the frontend has its own .gitignore for generated platform
+# files; these are the ones it does not cover.
+.dart_tool/
+.packages
+build/
+
+# Editors
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# macOS
+.DS_Store
+
+# Local media scratch
+/tmp/
+/work/
